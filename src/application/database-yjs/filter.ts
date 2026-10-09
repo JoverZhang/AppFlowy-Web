@@ -30,13 +30,12 @@ import {
   TextFilter,
   TextFilterCondition,
 } from '@/application/database-yjs/fields';
-import { FormulaFieldSchema, ReadFieldValueContext, readFormulaSchema } from '@/application/database-yjs/fields/formula';
+import { FormulaCellResult } from '@/application/database-yjs/fields/formula';
 import { EnhancedBigStats } from '@/application/database-yjs/fields/number/EnhancedBigStats';
 import { parseRollupTypeOption } from '@/application/database-yjs/fields/rollup/parse';
 import { RollupFilterMetadata, RollupFilterMode } from '@/application/database-yjs/fields/rollup/rollup.type';
 import { parseCheckboxValue } from '@/application/database-yjs/fields/text/utils';
 import {
-  evaluateFormulaForRow,
   formulaPredicateFieldType,
   formulaResultToDateCell,
   formulaResultToNumberText,
@@ -674,8 +673,8 @@ type FilterOptions = {
   getRollupCellText?: (rowId: string, fieldId: string) => string;
   /** Full rollup result including the raw numeric, for desktop-parity numeric comparison. */
   getRollupCellValue?: (rowId: string, fieldId: string) => RollupCellValue;
-  /** Member names, related titles and rollup results for formula filters. */
-  getFormulaContext?: (rowId: string) => ReadFieldValueContext;
+  /** Shared native results; filtering never evaluates formulas itself. */
+  getFormulaResult?: (rowId: string, fieldId: string) => FormulaCellResult | undefined;
 };
 
 type SelectOptionFilterContext = {
@@ -829,9 +828,6 @@ export function filterBy(
 
   if (filterArray.length === 0 || Object.keys(rowMetas).length === 0 || fields.size === 0) return rows;
 
-  // Formula filters evaluate every row; read the schema once for the pass.
-  let formulaSchema: FormulaFieldSchema[] | undefined;
-  const getFormulaSchema = () => (formulaSchema ??= readFormulaSchema(fields));
 
   const compileFilterPredicate = (filterNode: YDatabaseFilter): ((row: Row) => boolean) | null => {
     if (!filterNode || typeof filterNode !== 'object') {
@@ -892,14 +888,9 @@ export function filterBy(
       if (!snapshot) return false;
 
       if (fieldType === FieldType.Formula) {
-        const result = evaluateFormulaForRow(
-          field,
-          fieldId,
-          getFormulaSchema(),
-          snapshot.row,
-          rowId,
-          options?.getFormulaContext?.(rowId)
-        );
+        const result = options?.getFormulaResult?.(rowId, fieldId);
+
+        if (!result || result.error) return false;
 
         switch (formulaPredicateType) {
           case FieldType.Number:
@@ -1050,7 +1041,13 @@ export function numberFilterCheck(data: string, content: string, condition: numb
     return false;
   }
 
-  const res = EnhancedBigStats.compare(data, content);
+  // Explicit infinities bound every finite decimal, including values beyond
+  // JS's numeric range. Finite strings retain the exact decimal comparator.
+  const dataInfinity = /^[+-]?Infinity$/.test(data.trim());
+  const contentInfinity = /^[+-]?Infinity$/.test(content.trim());
+  const res = dataInfinity || contentInfinity
+    ? (dataInfinity ? Math.sign(Number(data)) : 0) - (contentInfinity ? Math.sign(Number(content)) : 0)
+    : EnhancedBigStats.compare(data, content);
 
   switch (condition) {
     case NumberFilterCondition.Equal:
@@ -1627,8 +1624,9 @@ export function rollupFilterCheck(
   }
 
   if (type === FieldType.Number) {
+    if (value?.error) return false;
     const data = value
-      ? value.rawNumeric !== undefined && Number.isFinite(value.rawNumeric)
+      ? value.rawNumeric !== undefined
         ? String(value.rawNumeric)
         : value.value.trim()
       : legacyText?.trim() ?? '';

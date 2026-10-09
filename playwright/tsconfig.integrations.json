@@ -7,7 +7,21 @@
     "support/connections.ts",
     "support/connections.fixture.tsx",
     "support/integrations-server.ts",
-    "support/integrations.fixture.tsx"
+    "support/integrations.fixture.tsx",
+    "support/native-formula-server.ts",
+    "support/native-formula.fixture.tsx",
+    "support/native-formula-consumers.fixture.tsx",
+    "support/native-formula-conversion-sync.fixture.tsx",
+    "support/native-formula-history.fixture.tsx",
+    "support/native-formula-observers.fixture.tsx",
+    "support/native-formula-rollup.fixture.ts",
+    "support/native-formula-conditions.fixture.tsx",
+    "support/native-formula-aggregates.fixture.tsx",
+    "support/native-formula-deletion.fixture.tsx",
+    "support/native-formula-values.fixture.ts",
+    "support/native-formula-compatibility.fixture.ts",
+    "support/native-formula-editor-server.ts",
+    "support/native-formula-editor.fixture.tsx"
   ],
   "references": []
 }

@@ -7,11 +7,6 @@ import * as Y from 'yjs';
 import { resolveUserAttributionUid, touchRowAttribution } from '@/application/database-yjs/attribution';
 import { calculateFieldValue } from '@/application/database-yjs/calculation';
 import { CalendarLayoutUpdate, updateCalendarLayoutSetting } from '@/application/database-yjs/calendar-layout';
-import {
-  initializeTimelineLayoutSetting,
-  TimelineLayoutUpdate,
-  updateTimelineLayoutSetting,
-} from '@/application/database-yjs/timeline-layout';
 import { cloneDatabaseCell } from '@/application/database-yjs/cell.clone';
 import { normalizeLegacyCellFieldType } from '@/application/database-yjs/cell.field-type';
 import { parseYDatabaseCellToCell } from '@/application/database-yjs/cell.parse';
@@ -42,17 +37,14 @@ import { deleteReciprocalRelationField } from '@/application/database-yjs/dispat
 import { useNewRowDispatch } from '@/application/database-yjs/dispatch/row';
 import { normalizeCreatedDatabaseFeedView, updateCreatesExactFeedView } from '@/application/database-yjs/feed-layout';
 import {
-  collectFormulaExternalReferences,
-  evaluateFormulaCell,
   FormulaCellResult,
   getFieldName,
   NumberFormat,
   parseChecklistData,
+  parseFormulaTypeOption,
   parseSelectOptionTypeOptions,
   SelectOption,
   SelectOptionColor,
-  readFormulaSchema,
-  ReadFieldValueContext,
   SelectTypeOption,
 } from '@/application/database-yjs/fields';
 import { parseRelationTypeOption } from '@/application/database-yjs/fields/relation/parse';
@@ -63,10 +55,10 @@ import { createRollupField } from '@/application/database-yjs/fields/rollup/util
 import { createDateTimeField } from '@/application/database-yjs/fields/text/utils';
 import { getDefaultFilterCondition, resolveRollupFilterTargetFieldType } from '@/application/database-yjs/filter';
 import { isFormQuestionFieldType } from '@/application/database-yjs/form-field-types';
-import { isDatabaseHistoryDocumentImmutable } from '@/application/database-yjs/immutable';
 import { attachNewFormQuestion } from '@/application/database-yjs/form-writer';
-import { getWorkspacePlanPolicy } from '@/application/workspace-plan-policy';
-import { observeFormulaRelatedDocuments, resolveFormulaRowContext } from '@/application/database-yjs/formula/materialize';
+import { observeFormulaRelatedDocuments } from '@/application/database-yjs/formula/materialize';
+import { evaluateNativeFormulaBatch } from '@/application/database-yjs/formula/native-session';
+import { formatNativeFormulaValue } from '@/application/database-yjs/formula/native-values';
 import {
   initializeGalleryLayoutSetting,
   normalizeCreatedDatabaseGalleryView,
@@ -92,6 +84,7 @@ import {
   runDatabaseRowAction,
 } from '@/application/database-yjs/history';
 import type { DatabaseHistoryAction } from '@/application/database-yjs/history';
+import { isDatabaseHistoryDocumentImmutable } from '@/application/database-yjs/immutable';
 import {
   initializeListLayoutSetting,
   normalizeCreatedDatabaseListView,
@@ -105,6 +98,8 @@ import {
   parseNumberGroupConfiguration,
   validateNumberGroupConfiguration,
 } from '@/application/database-yjs/number-grouping';
+import { evaluateRollupCell } from '@/application/database-yjs/rollup/cache';
+import { ComputedSession, releaseComputedFormulaEngines } from '@/application/database-yjs/rollup/computed';
 import {
   newRollupFilterMetadata,
   migrateRollupFilters, migrateRollupsForRelation,
@@ -113,6 +108,11 @@ import {
 import { getInlineViewRowOrders, materializeVisibleRowOrders } from '@/application/database-yjs/row-order-visibility';
 import { waitForDatabaseRowHydration } from '@/application/database-yjs/row.hydration';
 import { useCalculationFieldType, useCalendarLayoutSetting, useFieldType } from '@/application/database-yjs/selector';
+import {
+  initializeTimelineLayoutSetting,
+  TimelineLayoutUpdate,
+  updateTimelineLayoutSetting,
+} from '@/application/database-yjs/timeline-layout';
 import { deleteCollabDB } from '@/application/db';
 import { deleteOutboxByObjectId } from '@/application/sync-outbox';
 import {
@@ -160,6 +160,7 @@ import {
 } from '@/application/types';
 import { MetadataKey } from '@/application/user-metadata';
 import { isDatabaseContainer, isEmbeddedDatabaseViewWithoutChildren, isEmbeddedView } from '@/application/view-utils';
+import { getWorkspacePlanPolicy } from '@/application/workspace-plan-policy';
 import { applyYDoc } from '@/application/ydoc/apply';
 import { useCurrentUserOptional } from '@/components/main/app.hooks';
 import { Log } from '@/utils/log';
@@ -1472,6 +1473,7 @@ export function useCalculateFieldDispatch(fieldId: string) {
   const view = useDatabaseView();
   const sharedRoot = useSharedRoot();
   const fieldType = useCalculationFieldType(fieldId);
+  const sourceFieldType = useFieldType(fieldId);
 
   return useCallback(
     (cells: Map<string, unknown>) => {
@@ -1494,6 +1496,7 @@ export function useCalculateFieldDispatch(fieldId: string) {
         fieldType,
         calculationType: type,
         cellValues,
+        preserveNativeNumbers: sourceFieldType === FieldType.Formula,
       });
 
       if (newValue !== null && newValue !== oldValue) {
@@ -1509,7 +1512,7 @@ export function useCalculateFieldDispatch(fieldId: string) {
         );
       }
     },
-    [view, fieldId, fieldType, sharedRoot]
+    [view, fieldId, fieldType, sourceFieldType, sharedRoot]
   );
 }
 
@@ -3444,24 +3447,27 @@ function generateDateTimeFieldTypeOptions() {
 }
 
 const FIELD_SWITCH_ROW_LOAD_CONCURRENCY = 8;
-const fieldSwitchRequestVersions = new WeakMap<YDatabase, Map<FieldId, number>>();
+const fieldSwitchRequests = new WeakMap<YDatabase, Map<FieldId, { version: number; cancel?: () => void }>>();
 
 function beginFieldSwitchRequest(database: YDatabase, fieldId: FieldId): number {
-  let versions = fieldSwitchRequestVersions.get(database);
+  let requests = fieldSwitchRequests.get(database);
 
-  if (!versions) {
-    versions = new Map();
-    fieldSwitchRequestVersions.set(database, versions);
+  if (!requests) {
+    requests = new Map();
+    fieldSwitchRequests.set(database, requests);
   }
 
-  const version = (versions.get(fieldId) ?? 0) + 1;
+  const previous = requests.get(fieldId);
 
-  versions.set(fieldId, version);
+  previous?.cancel?.();
+  const version = (previous?.version ?? 0) + 1;
+
+  requests.set(fieldId, { version });
   return version;
 }
 
 function isCurrentFieldSwitchRequest(database: YDatabase, fieldId: FieldId, version: number): boolean {
-  return fieldSwitchRequestVersions.get(database)?.get(fieldId) === version;
+  return fieldSwitchRequests.get(database)?.get(fieldId)?.version === version;
 }
 
 function getFieldSwitchDatabaseRow(rowDoc?: YDoc): YDatabaseRow | undefined {
@@ -3523,7 +3529,7 @@ function materializeFormulaResult(
 
   if (targetType === FieldType.Number && result.rawNumeric !== undefined) {
     cell.set(YjsDatabaseKey.field_type, FieldType.Number);
-    cell.set(YjsDatabaseKey.data, String(result.rawNumeric));
+    cell.set(YjsDatabaseKey.data, Object.is(result.rawNumeric, -0) ? '-0' : String(result.rawNumeric));
     return;
   }
 
@@ -3622,7 +3628,7 @@ export function useSwitchPropertyType() {
   const currentUser = useCurrentUserOptional();
   const dateFormat = currentUser?.metadata?.[MetadataKey.DateFormat] as DateFormat | undefined;
   const timeFormat = currentUser?.metadata?.[MetadataKey.TimeFormat] as TimeFormat | undefined;
-  const { databaseDoc, loadView, getViewIdFromDatabaseId, bindViewSync, ensureRow, createRow, workspaceId } =
+  const { databaseDoc, loadView, getViewIdFromDatabaseId, bindViewSync, scheduleDeferredCleanup, ensureRow, createRow, workspaceId } =
     useDatabaseContext();
 
   return useCallback(
@@ -3645,7 +3651,7 @@ export function useSwitchPropertyType() {
 
       const rowIds = collectDatabaseRowIds(database, rowMap);
 
-      const performSwitch = (resolvedRowMap: Record<RowId, YDoc>, formulaContexts?: Map<RowId, ReadFieldValueContext>) => {
+      const performSwitch = (resolvedRowMap: Record<RowId, YDoc>, formulaResults = new Map<RowId, FormulaCellResult>()) => {
         const rows = Object.keys(resolvedRowMap);
 
         // Capture the relation option before the switch so we can clean up the
@@ -3658,29 +3664,13 @@ export function useSwitchPropertyType() {
           fieldBefore && oldFieldTypeBefore === FieldType.Relation && fieldType !== FieldType.Relation
             ? parseRelationTypeOption(fieldBefore)
             : null;
-        // Like Notion, converting a formula keeps what it displayed. Evaluate
-        // every row while the field is still a formula.
-        const formulaResults = new Map<RowId, FormulaCellResult>();
 
-        if (fieldBefore && oldFieldTypeBefore === FieldType.Formula) {
-          const schema = readFormulaSchema(database.get(YjsDatabaseKey.fields));
-
+        if (oldFieldTypeBefore === FieldType.Formula) {
           rows.forEach((rowId) => {
-            const row = getFieldSwitchDatabaseRow(resolvedRowMap[rowId]);
+            const result = formulaResults.get(rowId);
 
-            if (!row) return;
-            formulaResults.set(
-              rowId,
-              evaluateFormulaCell({
-                ...formulaContexts?.get(rowId),
-                schema,
-                field: fieldBefore,
-                fieldId,
-                row,
-                rowId,
-                format: { dateFormat, timeFormat },
-              })
-            );
+            if (!result || result.error) throw new Error(result?.error ?? `Formula result for row ${rowId} is not available`);
+            result.text = formatNativeFormulaValue(result.value, { numberFormat: parseFormulaTypeOption(fieldBefore).format, dateFormat, timeFormat });
           });
         }
 
@@ -4012,16 +4002,8 @@ export function useSwitchPropertyType() {
 
       const requiresEveryRow = fieldSwitchRequiresEveryRow(sourceType, fieldType);
       const everyRowIsLoaded = rowIds.every((rowId) => Boolean(getFieldSwitchDatabaseRow(rowMap[rowId])));
-      const formulaReferences =
-        sourceType === FieldType.Formula
-          ? collectFormulaExternalReferences(field, readFormulaSchema(database.get(YjsDatabaseKey.fields)))
-          : undefined;
-      const requiresExternalValues = Boolean(
-        formulaReferences &&
-          (formulaReferences.people || formulaReferences.relations.length || formulaReferences.rollups.length)
-      );
 
-      if ((!requiresEveryRow || everyRowIsLoaded) && !requiresExternalValues) {
+      if (sourceType !== FieldType.Formula && (!requiresEveryRow || everyRowIsLoaded)) {
         performSwitch(rowMap);
         return Promise.resolve();
       }
@@ -4032,7 +4014,7 @@ export function useSwitchPropertyType() {
       const loadRowsAndSwitch = async () => {
         let resolvedRowMap = rowMap;
         let rowSetIsStable = false;
-        const formulaContexts = new Map<RowId, ReadFieldValueContext>();
+        let formulaResults = new Map<RowId, FormulaCellResult>();
 
         while (!rowSetIsStable) {
           const latestRowIds = collectDatabaseRowIds(database, resolvedRowMap);
@@ -4042,6 +4024,10 @@ export function useSwitchPropertyType() {
             rowIds: latestRowIds,
             ensureRow,
           });
+
+          if (!isCurrentFieldSwitchRequest(database, fieldId, requestVersion)) {
+            throw new Error('Field-type switch was superseded by a newer request');
+          }
 
           let inputsChanged = false;
           const changed = () => {
@@ -4057,38 +4043,56 @@ export function useSwitchPropertyType() {
           });
 
           if (sourceType === FieldType.Formula && formulaField) {
-            const references = collectFormulaExternalReferences(formulaField, readFormulaSchema(fields));
+            const controller = new AbortController();
             const relatedDocuments = observeFormulaRelatedDocuments(
-              { loadView, createRow, getViewIdFromDatabaseId },
-              changed
+              { loadView, createRow, getViewIdFromDatabaseId, workspaceId, bindViewSync, scheduleDeferredCleanup },
+              changed,
+              controller.signal
             );
+            const session: ComputedSession = { path: new Set(), now: Date.now(), signal: controller.signal, observe: relatedDocuments.observe };
+            const request = fieldSwitchRequests.get(database)!.get(fieldId)!;
+            let disposed = false;
+            const disposePass = () => {
+              controller.abort();
+              releaseComputedFormulaEngines(session);
+              if (disposed) return;
+              disposed = true;
+              relatedDocuments.dispose();
+              fields?.unobserveDeep(fieldsChanged);
+              loadedRows.forEach(({ row }) => row.unobserveDeep(changed));
+            };
 
-            fields?.observeDeep(changed);
+            const fieldsChanged = () => {
+              changed();
+              if (Number(fields?.get(fieldId)?.get(YjsDatabaseKey.type)) !== sourceType) disposePass();
+            };
+
+            let aborted: () => void;
+            const cancelled = new Promise<never>((_resolve, reject) => {
+              aborted = () => reject(new DOMException('Formula conversion cancelled', 'AbortError'));
+              controller.signal.addEventListener('abort', aborted, { once: true });
+            });
+
+            request.cancel = disposePass;
+            fields?.observeDeep(fieldsChanged);
             loadedRows.forEach(({ row }) => row.observeDeep(changed));
             try {
-              // Bound row fan-out while awaiting all external inputs before any writes.
-              for (let index = 0; index < loadedRows.length; index += FIELD_SWITCH_ROW_LOAD_CONCURRENCY) {
-                await Promise.all(
-                  loadedRows.slice(index, index + FIELD_SWITCH_ROW_LOAD_CONCURRENCY).map(async ({ rowId, row }) => {
-                    formulaContexts.set(
-                      rowId,
-                      await resolveFormulaRowContext({
-                        references,
-                        row,
-                        rowId,
-                        database,
-                        baseDoc: databaseDoc,
-                        workspaceId,
-                        loaders: relatedDocuments.loaders,
-                      })
-                    );
-                  })
-                );
+              formulaResults = await Promise.race([
+                evaluateNativeFormulaBatch({
+                  database, baseDoc: databaseDoc, fieldId, rows: resolvedRowMap, loaders: relatedDocuments.loaders,
+                }, session, evaluateRollupCell),
+                cancelled,
+              ]);
+            } catch (error) {
+              if (!isCurrentFieldSwitchRequest(database, fieldId, requestVersion)) {
+                throw new Error('Field-type switch was superseded by a newer request');
               }
+
+              if (!inputsChanged) throw error;
             } finally {
-              relatedDocuments.dispose();
-              fields?.unobserveDeep(changed);
-              loadedRows.forEach(({ row }) => row.unobserveDeep(changed));
+              controller.signal.removeEventListener('abort', aborted!);
+              disposePass();
+              if (request.cancel === disposePass) request.cancel = undefined;
             }
           }
 
@@ -4109,7 +4113,7 @@ export function useSwitchPropertyType() {
             stableRowIds.every((rowId) => Boolean(getFieldSwitchDatabaseRow(resolvedRowMap[rowId])));
         }
 
-        performSwitch(resolvedRowMap, formulaContexts);
+        performSwitch(resolvedRowMap, formulaResults);
       };
 
       return loadRowsAndSwitch().catch((error: unknown) => {
@@ -4123,6 +4127,7 @@ export function useSwitchPropertyType() {
     },
     [
       bindViewSync,
+      scheduleDeferredCleanup,
       createRow,
       database,
       databaseDoc,

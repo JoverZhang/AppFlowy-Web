@@ -1,9 +1,10 @@
 import Big from 'big.js';
 
+import { isNumericCalculation, nativeNumberMedian } from '@/application/database-yjs/calculation';
 import { parseYDatabaseCellToCell } from '@/application/database-yjs/cell.parse';
 import { DateTimeCell, RollupListItem } from '@/application/database-yjs/cell.type';
-import { CalculationType, FieldType, RollupDisplayMode } from '@/application/database-yjs/database.type';
 import { waitForDatabaseHydration } from '@/application/database-yjs/database.hydration';
+import { CalculationType, FieldType, RollupDisplayMode } from '@/application/database-yjs/database.type';
 import { decodeCellToText } from '@/application/database-yjs/decode';
 import { getDateCellStr, getRowTimeString } from '@/application/database-yjs/fields/date/utils';
 import { EnhancedBigStats } from '@/application/database-yjs/fields/number/EnhancedBigStats';
@@ -11,13 +12,13 @@ import { NumberFormat } from '@/application/database-yjs/fields/number/number.ty
 import { parseNumberTypeOptions, stringifyDesktopNumberValue } from '@/application/database-yjs/fields/number/parse';
 import { parseRelationTypeOption } from '@/application/database-yjs/fields/relation/parse';
 import { readRollupCondition } from '@/application/database-yjs/fields/rollup/condition';
-import { formulaPredicateFieldType, formulaResultToDateCell } from '@/application/database-yjs/formula/filter';
 import { parseRollupTypeOption } from '@/application/database-yjs/fields/rollup/parse';
 import { parseCheckboxValue } from '@/application/database-yjs/fields/text/utils';
+import { formulaPredicateFieldType, formulaResultToDateCell } from '@/application/database-yjs/formula/filter';
 import { isDatabaseHistoryDocumentImmutable } from '@/application/database-yjs/immutable';
 import { getRelationRowIdsFromCell } from '@/application/database-yjs/relation/cell';
-import { getRowKey } from '@/application/database-yjs/row_meta';
 import { waitForDatabaseRowHydration } from '@/application/database-yjs/row.hydration';
+import { getRowKey } from '@/application/database-yjs/row_meta';
 import {
   LoadViewOptions,
   RowId,
@@ -32,8 +33,9 @@ import {
 } from '@/application/types';
 import { canonicalizeUserUid } from '@/application/user-uid';
 
+import { ComputedDependencyError, ComputedSession, ComputedSourceUnavailableError, enterComputedCell, evaluateRollupFormula, releaseComputedFormulaEngines } from './computed';
 import { rememberRollupTarget } from './filter';
-import { ComputedDependencyError, ComputedSession, enterComputedCell, evaluateRollupFormula } from './computed';
+
 import type { RollupSourceSync } from './source-sync';
 
 export type RollupFilterCell = {
@@ -233,7 +235,7 @@ async function loadRelatedDoc(
     const doc = await loadView?.(viewId, false, false, { databaseId, databaseMetadataOnly: true });
 
     if (!doc || !(await waitForDatabaseHydration(doc))) {
-      throw new Error(`Related database ${databaseId} could not be loaded for formula conversion`);
+      throw new ComputedSourceUnavailableError(`Related database ${databaseId} could not be loaded for formula conversion`);
     }
 
     return doc;
@@ -430,6 +432,10 @@ function formatDuration(seconds: number): string {
 function formatNumericResult(field: YDatabaseField, value: number): string {
   const fieldType = Number(field.get(YjsDatabaseKey.type)) as FieldType;
 
+  if (fieldType === FieldType.Formula && (!Number.isFinite(value) || Object.is(value, -0))) {
+    return Object.is(value, -0) ? '-0' : String(value);
+  }
+
   if (fieldType === FieldType.Number || fieldType === FieldType.Formula) {
     const format = parseNumberTypeOptions(field).format;
 
@@ -478,6 +484,13 @@ async function computeRollupInSession(context: RollupComputeContext, parent: Com
 
             if (session.signal?.aborted) throw new DOMException('Rollup observation cancelled', 'AbortError');
             if (doc) session.observe?.(doc);
+            if (
+              context.requireLoadedSources &&
+              (!doc || !(await waitForDatabaseRowHydration(doc, undefined, session.signal)))
+            ) {
+              throw new ComputedSourceUnavailableError(`Related row ${key} could not be hydrated for formula evaluation`);
+            }
+
             return doc;
           }
         : undefined,
@@ -491,13 +504,19 @@ export async function evaluateRollupCell(
   context: RollupComputeContext,
   session?: ComputedSession
 ): Promise<RollupCellValue> {
+  const current: ComputedSession = session ?? { path: new Set<string>(), now: Date.now() };
+  const ownsEngines = !current.nativeFormulaEngines;
+
+  current.nativeFormulaEngines ??= new Map();
   try {
-    return await computeRollupInSession(context, session ?? { path: new Set(), now: Date.now() });
+    return await computeRollupInSession(context, current);
   } catch (error) {
     if (error instanceof ComputedDependencyError && !context.requireLoadedSources)
       return { value: '', error: error.message };
     if (context.requireLoadedSources || context.loadSourceDocumentsDirectly) throw error;
     return { value: '', error: error instanceof Error ? error.message : 'Rollup source could not be loaded' };
+  } finally {
+    if (ownsEngines) releaseComputedFormulaEngines(current);
   }
 }
 
@@ -529,9 +548,9 @@ async function computeRollupCellValue(
     rollupOption.relation_field_id
   );
 
-  if (!relationField || Number(relationField.get(YjsDatabaseKey.type)) !== FieldType.Relation) {
-    return { value: '' };
-  }
+  if (!relationField) throw new Error(`Rollup relation property "${rollupOption.relation_field_id}" could not be found`);
+  if (Number(relationField.get(YjsDatabaseKey.type)) !== FieldType.Relation)
+    throw new Error(`Rollup source property "${rollupOption.relation_field_id}" must be a Relation`);
 
   const relationOption = parseRelationTypeOption(relationField);
 
@@ -558,7 +577,11 @@ async function computeRollupCellValue(
 
   const viewId = await context.getViewIdFromDatabaseId?.(relationOption.database_id);
 
-  if (!viewId) return { value: '' };
+  if (!viewId) {
+    if (context.requireLoadedSources)
+      throw new ComputedSourceUnavailableError(`Related database ${relationOption.database_id} could not be resolved for formula evaluation`);
+    return { value: '' };
+  }
 
   const relatedDoc = await loadRelatedDoc(
     viewId,
@@ -576,10 +599,28 @@ async function computeRollupCellValue(
   const relatedFields = relatedDatabase?.get(YjsDatabaseKey.fields);
   const targetField = relatedFields?.get(rollupOption.target_field_id);
 
-  if (!relatedDatabase || !targetField) return { value: '' };
+  if (!relatedDatabase || !targetField) {
+    if (context.requireLoadedSources)
+      throw new ComputedSourceUnavailableError(`Rollup target property "${rollupOption.target_field_id}" could not be found in related database ${relationOption.database_id}`);
+    return { value: '' };
+  }
 
   rememberRollupTarget(rollupField, targetField);
   const storedTargetType = Number(targetField.get(YjsDatabaseKey.type)) as FieldType;
+  const requiresNumericFormula = storedTargetType === FieldType.Formula &&
+    showAs !== RollupDisplayMode.OriginalList && showAs !== RollupDisplayMode.UniqueList &&
+    isNumericCalculation(calculationType);
+
+  if (storedTargetType === FieldType.Formula) {
+    const { nativeFormulaPropertyInSession } = await import('../formula/native-session');
+
+    await nativeFormulaPropertyInSession({
+      database: relatedDatabase,
+      baseDoc: relatedDoc,
+      fieldId: rollupOption.target_field_id,
+    }, session);
+  }
+
   const targetFieldType =
     storedTargetType === FieldType.Formula ? formulaPredicateFieldType(targetField, relatedFields) : storedTargetType;
   const withTargetFieldType = (result: RollupCellValue): RollupCellValue => ({
@@ -624,7 +665,12 @@ async function computeRollupCellValue(
 
   for (const relatedRowId of relatedRowIds) {
     if (session.signal?.aborted) throw new DOMException('Rollup observation cancelled', 'AbortError');
-    if (!context.createRow) continue;
+    if (!context.createRow) {
+      if (context.requireLoadedSources)
+        throw new ComputedSourceUnavailableError(`Related row ${relatedRowId} could not be loaded for formula evaluation`);
+      continue;
+    }
+
     const rowKey = getRowKey(relatedDoc.guid, relatedRowId);
     const relatedRowDoc = await context.createRow(rowKey);
 
@@ -632,7 +678,12 @@ async function computeRollupCellValue(
     const relatedRowRoot = relatedRowDoc.getMap(YjsEditorKey.data_section);
     const relatedRow = relatedRowRoot?.get(YjsEditorKey.database_row) as YDatabaseRow | undefined;
 
-    if (!relatedRow) continue;
+    if (!relatedRow) {
+      if (context.requireLoadedSources)
+        throw new ComputedSourceUnavailableError(`Related row ${relatedRowId} could not be hydrated for formula evaluation`);
+      continue;
+    }
+
     const cell = relatedRow.get(YjsDatabaseKey.cells)?.get(rollupOption.target_field_id);
     const parsedCell = cell ? parseYDatabaseCellToCell(cell, targetField) : undefined;
     let parsedData = parsedCell?.data;
@@ -660,7 +711,16 @@ async function computeRollupCellValue(
         computeRollupInSession
       );
 
-      text = result.error ? '' : result.text;
+      if (result.error) throw new Error(result.error);
+      if (requiresNumericFormula && result.value.type !== 'empty') {
+        if (result.rawNumeric === undefined) {
+          throw new Error(`Rollup ${CalculationType[calculationType]} requires Number values; related row ${relatedRowId} returned ${result.value.type}`);
+        }
+
+        numericValues.push(result.rawNumeric);
+      }
+
+      text = result.text;
       parsedData = result.rawNumeric ?? result.rawBoolean ?? result.rawDate?.start ?? text;
       filterData = parsedData;
       date = formulaResultToDateCell(result) ?? undefined;
@@ -710,9 +770,14 @@ async function computeRollupCellValue(
 
     if (targetFieldType === FieldType.Relation) filterData = getRelationRowIdsFromCell(cell);
     if (targetFieldType === FieldType.Number && parsedData !== undefined && parsedData !== '') {
-      text = stringifyDesktopNumberValue(String(parsedData), parseNumberTypeOptions(targetField).format);
+      const nativeSpecial = storedTargetType === FieldType.Formula && typeof parsedData === 'number' &&
+        (!Number.isFinite(parsedData) || Object.is(parsedData, -0));
+
+      if (!nativeSpecial) text = stringifyDesktopNumberValue(String(parsedData), parseNumberTypeOptions(targetField).format);
       // Native number list predicates use displayed percent units, once.
       try {
+        if (nativeSpecial) filterData = parsedData;
+        else
         filterData = new Big(String(parsedData))
           .times(parseNumberTypeOptions(targetField).format === NumberFormat.Percent ? 100 : 1)
           .toFixed();
@@ -735,8 +800,9 @@ async function computeRollupCellValue(
       collectedListItems.push({ label: text, rowId: relatedRowId, viewId });
     }
 
-    if (targetFieldType === FieldType.Number) {
-      const numeric = parseNumber(parsedData ?? text);
+    if (targetFieldType === FieldType.Number && !requiresNumericFormula) {
+      const numeric = storedTargetType === FieldType.Formula && typeof parsedData === 'number'
+        ? parsedData : parseNumber(parsedData ?? text);
 
       if (numeric !== null) {
         numericValues.push(numeric);
@@ -823,9 +889,7 @@ async function computeRollupCellValue(
 
       case CalculationType.Median: {
         if (numericValues.length === 0) return { value: '' };
-        const sorted = [...numericValues].sort((a, b) => a - b);
-        const mid = Math.floor(sorted.length / 2);
-        const median = sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+        const median = nativeNumberMedian(numericValues);
 
         return { value: formatNumericResult(targetField, median), rawNumeric: median };
       }

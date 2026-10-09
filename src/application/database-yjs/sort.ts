@@ -1,25 +1,25 @@
-import { FieldType, RollupDisplayMode, SortCondition } from '@/application/database-yjs/database.type';
 import {
   ConditionSortValue,
   getConditionSortValue,
   getRowConditionSnapshot,
 } from '@/application/database-yjs/condition-value-cache';
+import { FieldType, RollupDisplayMode, SortCondition } from '@/application/database-yjs/database.type';
 import { parseRollupTypeOption } from '@/application/database-yjs/fields';
-import { FormulaFieldSchema, ReadFieldValueContext, readFormulaSchema } from '@/application/database-yjs/fields/formula';
-import { evaluateFormulaForRow, formulaPredicateFieldType } from '@/application/database-yjs/formula/filter';
+import { FormulaCellResult } from '@/application/database-yjs/fields/formula';
+import { formulaPredicateFieldType } from '@/application/database-yjs/formula/filter';
 import { isNumericRollupField } from '@/application/database-yjs/rollup/utils';
 import { Row } from '@/application/database-yjs/selector';
 import { RowId, YDatabaseFields, YDatabaseSorts, YDoc, YjsDatabaseKey } from '@/application/types';
 import { canonicalizeUserUid } from '@/application/user-uid';
 
-type SortableValue = ConditionSortValue;
+type SortableValue = ConditionSortValue | { nativeNumber: number | undefined };
 
 type SortOptions = {
   getRelationCellText?: (rowId: string, fieldId: string) => string;
-  getRollupCellValue?: (rowId: string, fieldId: string) => { value: string; rawNumeric?: number };
+  getRollupCellValue?: (rowId: string, fieldId: string) => { value: string; rawNumeric?: number; error?: string };
   getAttributionName?: (uid: string) => string | undefined;
-  /** Member names, related titles and rollup results for formula sorts. */
-  getFormulaContext?: (rowId: string) => ReadFieldValueContext;
+  /** Shared native results; sorting never evaluates formulas itself. */
+  getFormulaResult?: (rowId: string, fieldId: string) => FormulaCellResult | undefined;
 };
 
 export function sortBy(
@@ -43,6 +43,21 @@ export function sortBy(
 
   // Create a function for comparison
   const compare = (a: SortableValue, b: SortableValue, order: string): number => {
+    if (typeof a === 'object' || typeof b === 'object') {
+      const left = typeof a === 'object' ? a.nativeNumber : undefined;
+      const right = typeof b === 'object' ? b.nativeNumber : undefined;
+
+      // Null/errors stay last in either direction; NaN is a distinct value.
+      if (left === undefined) return right === undefined ? 0 : 1;
+      if (right === undefined) return -1;
+      const result = Number.isNaN(left)
+        ? Number.isNaN(right) ? 0 : 1
+        : Number.isNaN(right) ? -1 : left < right ? -1 : left > right ? 1 : 0;
+
+      // Zero and NaN ties retain their original row order.
+      return order === 'asc' ? result : -result;
+    }
+
     if (a === undefined && b === undefined) return 0;
     // undefined value is placed at the end
     if (a === undefined) return order === 'asc' ? 1 : -1;
@@ -64,9 +79,6 @@ export function sortBy(
   // Prepare sort data, pre-calculate all values to avoid multiple calculations
   const rollupNumericCache = new Map<string, boolean>();
   const formulaPredicateCache = new Map<string, FieldType>();
-  // Formula sorts evaluate every row; read the schema once for the pass.
-  let formulaSchema: FormulaFieldSchema[] | undefined;
-  const getFormulaSchema = () => (formulaSchema ??= readFormulaSchema(fields));
   const sortData = rows.map((row) => {
     const values = sortArray.map((sort) => {
       const fieldId = sort.get(YjsDatabaseKey.field_id);
@@ -88,23 +100,13 @@ export function sortBy(
             return type;
           })();
         const defaultData = defaultValueForSort(predicateType, Number(sort.get(YjsDatabaseKey.condition)));
-        const snapshot = getRowConditionSnapshot(rowMetas[row.id]);
+        const result = options?.getFormulaResult?.(row.id, fieldId);
 
-        if (!snapshot) return defaultData;
-        const result = evaluateFormulaForRow(
-          field,
-          fieldId,
-          getFormulaSchema(),
-          snapshot.row,
-          row.id,
-          options?.getFormulaContext?.(row.id)
-        );
-
-        if (result.error) return defaultData;
+        if (predicateType === FieldType.Number)
+          return { nativeNumber: result && !result.error ? result.rawNumeric : undefined };
+        if (!result || result.error) return defaultData;
 
         switch (predicateType) {
-          case FieldType.Number:
-            return result.rawNumeric !== undefined && Number.isFinite(result.rawNumeric) ? result.rawNumeric : defaultData;
           case FieldType.DateTime:
             return result.rawDate ? result.rawDate.start : defaultData;
           case FieldType.Checkbox:
@@ -131,7 +133,8 @@ export function sortBy(
 
       const defaultData = defaultValueForSort(fieldType, Number(sort.get(YjsDatabaseKey.condition)), isRollupNumeric);
 
-      if (!snapshot) return defaultData;
+      if (!snapshot)
+        return isRollupNumeric && options?.getRollupCellValue ? { nativeNumber: undefined } : defaultData;
 
       if (fieldType === FieldType.LastEditedTime) {
         return snapshot.row.get(YjsDatabaseKey.last_modified);
@@ -171,11 +174,7 @@ export function sortBy(
         const rollupValue = options.getRollupCellValue(rowId, fieldId);
 
         if (isRollupNumeric) {
-          if (typeof rollupValue?.rawNumeric === 'number' && Number.isFinite(rollupValue.rawNumeric)) {
-            return rollupValue.rawNumeric;
-          }
-
-          return defaultData;
+          return { nativeNumber: rollupValue && !rollupValue.error ? rollupValue.rawNumeric : undefined };
         }
 
         return rollupValue?.value || defaultData;

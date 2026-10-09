@@ -7,6 +7,8 @@ import { NumberFormat } from '@/application/database-yjs/fields/number/number.ty
 import { RollupVisualizationOption } from '@/application/database-yjs/fields/rollup/rollup.type';
 import { DateFormat, FieldId, RowId, TimeFormat } from '@/application/types';
 
+import type { RowError, Value } from '@notion-formula/sdk';
+
 export interface Cell {
   createdAt: number;
   lastModified: number;
@@ -115,6 +117,7 @@ export interface RollupListItem {
 export interface RollupCell extends Cell {
   fieldType: FieldType.Rollup;
   data: string;
+  error?: string;
   rawNumeric?: number;
   list?: string[];
   listItems?: RollupListItem[];
@@ -126,6 +129,13 @@ export interface RollupCell extends Cell {
 
 export interface FormulaCell extends Cell {
   fieldType: FieldType.Formula;
+  /** Native outcomes keep loading, real null, schema failures and row errors distinct. */
+  evaluationState?: 'pending' | 'value' | 'null' | 'not-ready' | 'error';
+  errorSource?: 'host' | 'host-cycle' | 'host-projection' | 'runtime' | 'worker';
+  /** Preserve the complete native error payload even when the UI shows one message. */
+  nativeErrors?: readonly RowError[];
+  /** Retain the native value when the host display cannot represent it. */
+  nativeValue?: Value;
   /** Result as text, with the field's number format and the default date format. */
   data: string;
   /** The evaluated value; the cell shows its dates in the viewer's date and time formats. */

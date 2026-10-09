@@ -34,6 +34,9 @@ importers:
 
   .:
     dependencies:
+      '@notion-formula/sdk':
+        specifier: link:./.notion-formula-sdk
+        version: link:.notion-formula-sdk
       '@appflowyinc/editor':
         specifier: ^0.1.13
         version: 0.1.13(@types/react-dom@18.3.7(@types/react@18.3.21))(@types/react@18.3.21)(i18next-resources-to-backend@1.2.1)(i18next@22.5.1)(react-dom@18.3.1(react@18.3.1))(react-i18next@14.1.3(i18next@22.5.1)(react-dom@18.3.1(react@18.3.1))(react@18.3.1))(react@18.3.1)(slate-history@0.100.0(slate@0.101.5))(slate-react@0.101.6(react-dom@18.3.1(react@18.3.1))(react@18.3.1)(slate@0.101.5))(slate@0.101.5)(ts-node@10.9.2(@types/node@20.19.27)(typescript@4.9.5))
@@ -283,9 +286,6 @@ importers:
       quill-delta:
         specifier: ^5.1.0
         version: 5.1.0
-      re2js:
-        specifier: 2.8.6
-        version: 2.8.6
       react:
         specifier: ^18.2.0
         version: 18.3.1
@@ -7190,10 +7190,6 @@ packages:
 
   randombytes@2.1.0:
     resolution: {integrity: sha512-vYl3iOX+4CKUWuxGi9Ukhie6fsqXqS9FE2Zaic4tNFD2N2QQaXOMFbuKK4QmDHC0JO6B1Zp41J0LpT0oR68amQ==}
-
-  re2js@2.8.6:
-    resolution: {integrity: sha512-xLgQil4kIUCrAzVk9fRSkxkFNwmygLFjVxXrLc65aE1F0+Zsb8rxumFBy4XKyvgMCTL6kilDq3EZ0piE2dP/Dg==}
-    engines: {node: '>=18.0.0'}
 
   react-beautiful-dnd@13.1.1:
     resolution: {integrity: sha512-0Lvs4tq2VcrEjEgDXHjT98r+63drkKEgqyxdA7qD3mvKwga6a5SscbdLPO2IExotU1jW8L0Ksdl0Cj2AF67nPQ==}
@@ -16359,8 +16355,6 @@ snapshots:
     dependencies:
       safe-buffer: 5.2.1
     optional: true
-
-  re2js@2.8.6: {}
 
   react-beautiful-dnd@13.1.1(react-dom@18.3.1(react@18.3.1))(react@18.3.1):
     dependencies:
